@@ -1,12 +1,14 @@
+use alloy_primitives::Address;
 use rustc_hash::FxHashMap;
 
-pub struct Reward {
-    reward: FxHashMap<usize, &'static str>,
+pub struct Rewards {
+    rewards: FxHashMap<usize, &'static str>,
 }
 
-impl Reward {
+impl Rewards {
+    /// Creates a new `Rewards` table.
     pub fn new() -> Self {
-        let reward = FxHashMap::from_iter([
+        let rewards = FxHashMap::from_iter([
             (5, "4"),
             (6, "454"),
             (7, "57926"),
@@ -208,11 +210,121 @@ impl Reward {
             (399, "340282366920938463463374607431768211456"),
             (420, "87112285931760246646623899502532662132736"),
         ]);
-        Reward { reward }
+        Rewards { rewards }
     }
 
+    /// Gets the reward for the given score.
     #[inline]
-    pub fn get(&self, value: &usize) -> Option<&'static str> {
-        self.reward.get(value).copied()
+    pub fn get(&self, value: Score) -> Option<&'static str> {
+        self.rewards.get(&value.key()).copied()
+    }
+}
+
+impl Default for Rewards {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A score for an address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Score {
+    /// Total number of zero bytes in the address.
+    pub total: u8,
+    /// Number of zero bytes at the beginning of the address.
+    pub leading: u8,
+}
+
+impl Score {
+    /// Calculates the score for the given address.
+    #[inline]
+    pub fn calculate(address: &Address) -> Self {
+        let total = address.iter().filter(|&&b| b == 0).count() as u8;
+        let leading = {
+            let a = u128::from_be_bytes(address[..16].try_into().unwrap());
+            let b = u32::from_be_bytes(address[16..20].try_into().unwrap());
+            let mut leading_bits = a.leading_zeros();
+            if leading_bits == u128::BITS {
+                leading_bits += b.leading_zeros();
+            }
+            (leading_bits / 8) as u8
+        };
+        Self { total, leading }
+    }
+
+    /// Calculates the key to look up in the rewards table.
+    #[inline]
+    fn key(&self) -> usize {
+        self.leading as usize * 20 + self.total as usize
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn score_reference(address: &Address) -> Score {
+        Score {
+            total: address.iter().filter(|&&b| b == 0).count() as u8,
+            leading: address.iter().position(|&b| b != 0).unwrap_or(20) as u8,
+        }
+    }
+
+    #[test]
+    fn score_calculation() {
+        let tests = [
+            ("1111111111111111111111111111111111111111", (0, 0)),
+            ("0011111111111111111111111111111111111111", (1, 1)),
+            ("0000111111111111111111111111111111111111", (2, 2)),
+            ("0011001111111111111111111111111111111111", (2, 1)),
+            ("0000000000000000111111111111111111111111", (8, 8)),
+            ("0000000000000000001111111111111111111111", (9, 9)),
+            ("0000000000000011001111111111111111111111", (8, 7)),
+            ("0000000000000000000000000000000011111111", (16, 16)),
+            ("0000000000000000000000000000000000111111", (17, 17)),
+            ("0000000000000000000000000000000011001111", (17, 16)),
+            ("0000000000000000000000000000001100001111", (17, 15)),
+        ];
+        for (address, (total, leading)) in tests {
+            let address = address.parse().unwrap();
+            let expected_score = Score { total, leading };
+            assert_eq!(expected_score, score_reference(&address));
+            assert_eq!(Score::calculate(&address), expected_score, "{address}");
+        }
+    }
+
+    #[test]
+    fn random_score_calculation() {
+        let mut rng = rand::thread_rng();
+        for _ in 0..256 {
+            let address = Address::random_with(&mut rng);
+            assert_eq!(Score::calculate(&address), score_reference(&address));
+        }
+    }
+
+    #[test]
+    fn reward_calculation() {
+        let rewards = Rewards::new();
+        let tests = [
+            ("0x00000049da7B57fc3e21Dc1020EDD77555d1b286", "1"),
+            ("0x00000089468965a58FDC920f66f149092a8D2808", "1"),
+            ("0x0000A6832be100b395A69B000fe00A542dA71071", "2"),
+            ("0x00001006001A00c1583f545B29f971B56eF38657", "2"),
+            ("0x0000A1d57aA3e2462772B0006Bd2bb2C001C78B6", "2"),
+            ("0x5dF21975f600c30016007493981c003994000F03", "4"),
+            ("0x0000008cf8957fdF4Cc6f8009c302710D4206CBb", "16"),
+            ("0x000000597A8f1485A5a4de00C889517E060427DA", "16"),
+            ("0x00000059A7f2AdF974E19370000F0A50D7b08a46", "16"),
+            ("0x00EF0066AB6102B2007C00BcDE1bEece70060066", "18"),
+        ];
+        for (address, expected_reward) in tests {
+            let address = address.parse().unwrap();
+            let score = Score::calculate(&address);
+            assert_eq!(
+                rewards.get(score),
+                Some(expected_reward),
+                "{address} -> {score:?}"
+            );
+        }
     }
 }

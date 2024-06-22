@@ -14,6 +14,9 @@ $ export FACTORY="0x0000000000ffe8b47b3e2130213b802212439497"
 $ export CALLER="<YOUR_DEPLOYER_ADDRESS_OF_CHOICE_GOES_HERE>"
 $ export INIT_CODE_HASH="<HASH_OF_YOUR_CONTRACT_INIT_CODE_GOES_HERE>"
 $ cargo run --release $FACTORY $CALLER $INIT_CODE_HASH
+
+# Note: if compilation fails, try disabling default features:
+$ cargo run --release --no-default-features $FACTORY $CALLER $INIT_CODE_HASH
 ```
 
 For each efficient address found, the salt, resultant addresses, and value *(i.e. approximate rarity)* will be written to `efficient_addresses.txt`. Verify that one of the salts actually results in the intended address before getting in too deep - ideally, the CREATE2 factory will have a view method for checking what address you'll get for submitting a particular salt. Be sure not to change the factory address or the init code without first removing any existing data to prevent the two salt types from becoming commingled. There's also a *very* simple monitoring tool available if you run `$python3 analysis.py` in another tab.

@@ -1,13 +1,12 @@
 #![warn(unused_crate_dependencies, unreachable_pub)]
 #![deny(unused_must_use, rust_2018_idioms)]
 
-use alloy_primitives::{hex, Address, FixedBytes};
-use byteorder::{BigEndian, ByteOrder, LittleEndian};
+use alloy_primitives::{hex, Address, FixedBytes, Keccak256};
 use console::Term;
 use fs4::FileExt;
 use ocl::{Buffer, Context, Device, MemFlags, Platform, ProQue, Program, Queue};
 use rand::{thread_rng, Rng};
-use rayon::prelude::*;
+use reward::Score;
 use separator::Separatable;
 use std::error::Error;
 use std::fmt::Write as _;
@@ -15,10 +14,9 @@ use std::fs::{File, OpenOptions};
 use std::io::prelude::*;
 use std::time::{SystemTime, UNIX_EPOCH};
 use terminal_size::{terminal_size, Height};
-use tiny_keccak::{Hasher, Keccak};
 
 mod reward;
-pub use reward::Reward;
+pub use reward::Rewards;
 
 // workset size (tweak this!)
 const WORK_SIZE: u32 = 0x4000000; // max. 0x15400000 to abs. max 0xffffffff
@@ -49,8 +47,8 @@ pub struct Config {
 
 /// Validate the provided arguments and construct the Config struct.
 impl Config {
-    pub fn new(mut args: std::env::Args) -> Result<Self, &'static str> {
-        // get args, skipping first arg (program name)
+    pub fn from_args(mut args: impl Iterator<Item = String>) -> Result<Self, &'static str> {
+        // skip first arg (program name)
         args.next();
 
         let Some(factory_address_string) = args.next() else {
@@ -77,25 +75,14 @@ impl Config {
         };
 
         // convert main arguments from hex string to vector of bytes
-        let Ok(factory_address_vec) = hex::decode(factory_address_string) else {
+        let Ok(factory_address) = hex::decode_to_array(factory_address_string) else {
             return Err("could not decode factory address argument");
         };
-        let Ok(calling_address_vec) = hex::decode(calling_address_string) else {
+        let Ok(calling_address) = hex::decode_to_array(calling_address_string) else {
             return Err("could not decode calling address argument");
         };
-        let Ok(init_code_hash_vec) = hex::decode(init_code_hash_string) else {
+        let Ok(init_code_hash) = hex::decode_to_array(init_code_hash_string) else {
             return Err("could not decode initialization code hash argument");
-        };
-
-        // convert from vector to fixed array
-        let Ok(factory_address) = factory_address_vec.try_into() else {
-            return Err("invalid length for factory address argument");
-        };
-        let Ok(calling_address) = calling_address_vec.try_into() else {
-            return Err("invalid length for calling address argument");
-        };
-        let Ok(init_code_hash) = init_code_hash_vec.try_into() else {
-            return Err("invalid length for initialization code hash argument");
         };
 
         // convert gpu arguments to u8 values
@@ -146,7 +133,7 @@ pub fn cpu(config: Config) -> Result<(), Box<dyn Error>> {
     let file = output_file();
 
     // create object for computing rewards (relative rarity) for a given address
-    let rewards = Reward::new();
+    let rewards = Rewards::new();
 
     // begin searching for addresses
     loop {
@@ -158,80 +145,104 @@ pub fn cpu(config: Config) -> Result<(), Box<dyn Error>> {
         header[41..].copy_from_slice(&FixedBytes::<6>::random()[..]);
 
         // create new hash object
-        let mut hash_header = Keccak::v256();
+        let mut hash_header = Keccak256::new();
 
         // update hash with header
-        hash_header.update(&header);
+        hash_header.update(header);
 
         // iterate over a 6-byte nonce and compute each address
-        (0..MAX_INCREMENTER)
-            .into_par_iter() // parallelization
-            .for_each(|salt| {
-                let salt = salt.to_le_bytes();
-                let salt_incremented_segment = &salt[..6];
+        let n_jobs = std::thread::available_parallelism().map_or(1, |x| x.get());
+        std::thread::scope(|scope| {
+            for idx in 0..n_jobs {
+                let f = mk_cpu_task(&config, &file, &rewards, &header, &hash_header, idx, n_jobs);
+                std::thread::Builder::new()
+                    .name(format!("worker-{idx}"))
+                    .spawn_scoped(scope, f)
+                    .unwrap();
+            }
+        })
+    }
+}
 
-                // clone the partially-hashed object
-                let mut hash = hash_header.clone();
+fn mk_cpu_task<'a>(
+    config: &'a Config,
+    file: &'a File,
+    rewards: &'a Rewards,
+    header: &'a [u8; 47],
+    hash_header: &'a Keccak256,
+    idx: usize,
+    incr: usize,
+) -> impl FnOnce() + 'a {
+    move || {
+        cpu_task(
+            config,
+            file,
+            rewards,
+            header,
+            hash_header,
+            idx as u64,
+            incr as u64,
+        )
+    }
+}
 
-                // update with body and footer (total: 38 bytes)
-                hash.update(salt_incremented_segment);
-                hash.update(&config.init_code_hash);
+fn cpu_task(
+    config: &Config,
+    mut file: &File,
+    rewards: &Rewards,
+    header: &[u8; 47],
+    hash_header: &Keccak256,
+    mut salt: u64,
+    incr: u64,
+) {
+    while salt < MAX_INCREMENTER {
+        let salt_bytes = salt.to_le_bytes();
+        salt += incr;
+        let salt_incremented_segment = &salt_bytes[..6];
 
-                // hash the payload and get the result
-                let mut res: [u8; 32] = [0; 32];
-                hash.finalize(&mut res);
+        // clone the partially-hashed object
+        let mut hash = hash_header.clone();
 
-                // get the address that results from the hash
-                let address = <&Address>::try_from(&res[12..]).unwrap();
+        // update with body and footer (total: 38 bytes)
+        hash.update(salt_incremented_segment);
+        hash.update(config.init_code_hash);
 
-                // count total and leading zero bytes
-                let mut total = 0;
-                let mut leading = 21;
-                for (i, &b) in address.iter().enumerate() {
-                    if b == 0 {
-                        total += 1;
-                    } else if leading == 21 {
-                        // set leading on finding non-zero byte
-                        leading = i;
-                    }
-                }
+        // hash the payload and get the result
+        let res = hash.finalize();
 
-                // only proceed if there are at least three zero bytes
-                if total < 3 {
-                    return;
-                }
+        // get the address that results from the hash
+        let address = <&Address>::try_from(&res[12..]).unwrap();
 
-                // look up the reward amount
-                let key = leading * 20 + total;
-                let reward_amount = rewards.get(&key);
+        // calculate the score of the address
+        let score = Score::calculate(address);
 
-                // only proceed if an efficient address has been found
-                if reward_amount.is_none() {
-                    return;
-                }
+        // only proceed if there are at least three zero bytes
+        if score.total < 3 {
+            continue;
+        }
 
-                // get the full salt used to create the address
-                let header_hex_string = hex::encode(header);
-                let body_hex_string = hex::encode(salt_incremented_segment);
-                let full_salt = format!("0x{}{}", &header_hex_string[42..], &body_hex_string);
+        // only proceed if an efficient address has been found
+        let Some(reward_amount) = rewards.get(score) else {
+            continue;
+        };
 
-                // display the salt and the address.
-                let output = format!(
-                    "{full_salt} => {address} => {}",
-                    reward_amount.unwrap_or("0")
-                );
-                println!("{output}");
+        // get the full salt used to create the address
+        let header_hex_string = hex::encode(header);
+        let body_hex_string = hex::encode(salt_incremented_segment);
+        let full_salt = format!("0x{}{}", &header_hex_string[42..], &body_hex_string);
 
-                // create a lock on the file before writing
-                file.lock_exclusive().expect("Couldn't lock file.");
+        // display the salt and the address.
+        let output = format!("{full_salt} => {address} => {reward_amount}");
+        println!("{output}");
 
-                // write the result to file
-                writeln!(&file, "{output}")
-                    .expect("Couldn't write to `efficient_addresses.txt` file.");
+        // create a lock on the file before writing
+        file.lock_exclusive().expect("Couldn't lock file.");
 
-                // release the file lock
-                file.unlock().expect("Couldn't unlock file.")
-            });
+        // write the result to file
+        writeln!(file, "{output}").expect("Couldn't write to `efficient_addresses.txt` file.");
+
+        // release the file lock
+        file.unlock().expect("Couldn't unlock file.")
     }
 }
 
@@ -266,7 +277,7 @@ pub fn gpu(config: Config) -> ocl::Result<()> {
     let file = output_file();
 
     // create object for computing rewards (relative rarity) for a given address
-    let rewards = Reward::new();
+    let rewards = Rewards::new();
 
     // track how many addresses have been found and information about them
     let mut found: u64 = 0;
@@ -333,7 +344,7 @@ pub fn gpu(config: Config) -> ocl::Result<()> {
 
         // reset nonce & create a buffer to view it in little-endian
         // for more uniformly distributed nonces, we shall initialize it to a random value
-        let mut nonce: [u32; 1] = rng.gen();
+        let mut nonce: u32 = rng.gen();
         let mut view_buf = [0; 8];
 
         // build a corresponding buffer for passing the nonce to the kernel
@@ -341,11 +352,11 @@ pub fn gpu(config: Config) -> ocl::Result<()> {
             .queue(ocl_pq.queue().clone())
             .flags(MemFlags::new().read_only())
             .len(1)
-            .copy_host_slice(&nonce)
+            .copy_host_slice(&[nonce])
             .build()?;
 
         // establish a buffer for nonces that result in desired addresses
-        let mut solutions: Vec<u64> = vec![0; 1];
+        let mut solutions = vec![0u64; 1];
         let solutions_buffer = Buffer::builder()
             .queue(ocl_pq.queue().clone())
             .flags(MemFlags::new().write_only())
@@ -398,7 +409,7 @@ pub fn gpu(config: Config) -> ocl::Result<()> {
                 }
 
                 // fill the buffer for viewing the properly-formatted nonce
-                LittleEndian::write_u64(&mut view_buf, (nonce[0] as u64) << 32);
+                view_buf.copy_from_slice(&((nonce as u64) << 32).to_le_bytes());
 
                 // calculate the terminal height, defaulting to a height of ten rows
                 let height = terminal_size().map(|(_w, Height(h))| h).unwrap_or(10);
@@ -427,7 +438,7 @@ pub fn gpu(config: Config) -> ocl::Result<()> {
                     "current search space: {}xxxxxxxx{:08x}\t\t\
                      threshold: {} leading or {} total zeroes",
                     hex::encode(salt),
-                    BigEndian::read_u64(&view_buf),
+                    u64::from_be_bytes(view_buf),
                     config.leading_zeroes_threshold,
                     config.total_zeroes_threshold
                 ))?;
@@ -467,14 +478,14 @@ pub fn gpu(config: Config) -> ocl::Result<()> {
             }
 
             // if no solution has yet been found, increment the nonce
-            nonce[0] += 1;
+            nonce += 1;
 
             // update the nonce buffer with the incremented nonce value
             nonce_buffer = Buffer::builder()
                 .queue(ocl_pq.queue().clone())
                 .flags(MemFlags::new().read_write())
                 .len(1)
-                .copy_host_slice(&nonce)
+                .copy_host_slice(&[nonce])
                 .build()?;
         }
 
@@ -494,33 +505,15 @@ pub fn gpu(config: Config) -> ocl::Result<()> {
             solution_message[45..53].copy_from_slice(&solution);
             solution_message[53..].copy_from_slice(&config.init_code_hash);
 
-            // create new hash object
-            let mut hash = Keccak::v256();
-
-            // update with header
-            hash.update(&solution_message);
-
-            // hash the payload and get the result
-            let mut res: [u8; 32] = [0; 32];
-            hash.finalize(&mut res);
+            let res = alloy_primitives::keccak256(solution_message);
 
             // get the address that results from the hash
             let address = <&Address>::try_from(&res[12..]).unwrap();
 
-            // count total and leading zero bytes
-            let mut total = 0;
-            let mut leading = 0;
-            for (i, &b) in address.iter().enumerate() {
-                if b == 0 {
-                    total += 1;
-                } else if leading == 0 {
-                    // set leading on finding non-zero byte
-                    leading = i;
-                }
-            }
+            // only proceed if an efficient address has been found
+            let score @ Score { total, leading } = Score::calculate(address);
+            let reward = rewards.get(score).unwrap_or("0");
 
-            let key = leading * 20 + total;
-            let reward = rewards.get(&key).unwrap_or("0");
             let output = format!(
                 "0x{}{}{} => {} => {}",
                 hex::encode(config.calling_address),
